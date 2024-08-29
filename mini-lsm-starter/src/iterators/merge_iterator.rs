@@ -45,7 +45,20 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut map = BinaryHeap::new();
+
+        for (idx, boxed_element) in iters.into_iter().enumerate() {
+            if boxed_element.is_valid() {
+                map.push(HeapWrapper(idx, boxed_element));
+            }
+        }
+
+        let current = map.pop();
+
+        Self {
+            iters: map,
+            current,
+        }
     }
 }
 
@@ -55,18 +68,51 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let key = self.current.as_ref().unwrap().1.key().to_key_vec();
+
+        loop {
+            let mut current = self.current.take().unwrap();
+
+            if current.1.is_valid() {
+                current.1.next()?;
+
+                // 1. 当前子迭代器合法且next之后仍合法
+                if current.1.is_valid() {
+                    self.iters.push(current);
+                }
+            }
+
+            // 2. 当前子迭代器合法且next之后不合法
+            // 3. 当前子迭代器已不合法
+            self.current = self.iters.pop();
+
+            if self.current.is_none()
+                || self.current.as_ref().unwrap().1.key() != key.as_key_slice()
+            {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        if self.current.is_some() {
+            self.iters.len() + 1
+        } else {
+            self.iters.len()
+        }
     }
 }

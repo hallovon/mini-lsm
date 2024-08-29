@@ -15,11 +15,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -154,7 +158,17 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+
+        let mut flush_thread = self.flush_thread.lock();
+        if let Some(flush_thread) = flush_thread.take() {
+            flush_thread
+                .join()
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -237,6 +251,11 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        if !path.exists() {
+            std::fs::create_dir_all(path)
+                .map_err(|_| anyhow::anyhow!("failed to create DB dir"))?;
+        }
+
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -278,8 +297,66 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let snapshot = {
+            let guard = self.state.read();
+            guard.clone()
+        };
+
+        if let Some(value) = snapshot.memtable.get(key) {
+            if value.is_empty() {
+                return Ok(None);
+            } else {
+                return Ok(Some(value));
+            }
+        }
+
+        for memtable in snapshot.imm_memtables.iter() {
+            match memtable.get(key) {
+                Some(value) if value.is_empty() => return Ok(None),
+                Some(value) => return Ok(Some(value)),
+                None => (),
+            }
+        }
+
+        let keep_table = |key: &[u8], table: Arc<SsTable>| {
+            if key_within(
+                key,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                if let Some(ref bloom) = table.bloom {
+                    let h = farmhash::fingerprint32(key);
+                    if bloom.may_contain(h) {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+
+            false
+        };
+
+        let mut l0_iters = vec![];
+        for idx in snapshot.l0_sstables.iter() {
+            let table = snapshot.sstables[idx].clone();
+
+            if keep_table(key, table.clone()) {
+                l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                    table,
+                    KeySlice::from_slice(key),
+                )?));
+            }
+        }
+
+        let l0_iter = MergeIterator::create(l0_iters);
+
+        if l0_iter.is_valid() && l0_iter.key().raw_ref() == key && !l0_iter.value().is_empty() {
+            return Ok(Some(Bytes::copy_from_slice(l0_iter.value())));
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +365,23 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, value)?;
+            size = guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, b"")?;
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -317,14 +404,68 @@ impl LsmStorageInner {
         unimplemented!()
     }
 
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+
+            if guard.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let memtable = MemTable::create(self.next_sst_id());
+
+        let mut guard = self.state.write();
+        let mut snapshot = guard.as_ref().clone();
+        let old_memtable = std::mem::replace(&mut snapshot.memtable, Arc::new(memtable));
+        snapshot.imm_memtables.insert(0, old_memtable.clone());
+        *guard = Arc::new(snapshot);
+
+        drop(guard);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        let mut snapshot = {
+            let guard = self.state.read();
+            guard.as_ref().clone()
+        };
+
+        let memtable_to_flush = snapshot
+            .imm_memtables
+            .last()
+            .expect("no imm memtables!")
+            .clone();
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut builder)?;
+        let sst_id = memtable_to_flush.id();
+        let sst = Arc::new(builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?);
+
+        snapshot.imm_memtables.pop();
+        snapshot.l0_sstables.insert(0, sst_id);
+        snapshot.sstables.insert(sst.sst_id(), sst);
+
+        {
+            let mut guard = self.state.write();
+            *guard = snapshot.into();
+        }
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -335,9 +476,101 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let mut boxed_iter = vec![];
+        boxed_iter.push(Box::new(snapshot.memtable.scan(lower, upper)));
+        for memtable in snapshot.imm_memtables.iter() {
+            boxed_iter.push(Box::new(memtable.scan(lower, upper)));
+        }
+        let memtable_iter = MergeIterator::create(boxed_iter);
+
+        let mut boxed_iter = vec![];
+        for idx in snapshot.l0_sstables.iter() {
+            let table = snapshot.sstables[idx].clone();
+            if range_overlap(
+                lower,
+                upper,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                let iter = match lower {
+                    Bound::Included(value) => {
+                        SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(value))?
+                    }
+                    Bound::Excluded(value) => {
+                        let mut iter = SsTableIterator::create_and_seek_to_key(
+                            table,
+                            KeySlice::from_slice(value),
+                        )?;
+
+                        if iter.is_valid() && iter.key() == KeySlice::from_slice(value) {
+                            iter.next()?;
+                        }
+
+                        iter
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+                };
+
+                boxed_iter.push(Box::new(iter));
+            }
+        }
+        let sstable_iter = MergeIterator::create(boxed_iter);
+
+        let inner_iter = TwoMergeIterator::create(memtable_iter, sstable_iter)?;
+        let lsm_iter = LsmIterator::new(inner_iter, upper.map(Bytes::copy_from_slice))?;
+        let fused_iter = FusedIterator::new(lsm_iter);
+
+        Ok(fused_iter)
     }
+}
+
+fn key_within(user_key: &[u8], table_begin: KeySlice, table_end: KeySlice) -> bool {
+    table_begin.raw_ref() <= user_key && user_key <= table_end.raw_ref()
+}
+
+fn range_overlap(
+    user_lower: Bound<&[u8]>,
+    user_upper: Bound<&[u8]>,
+    table_lower: KeySlice,
+    table_upper: KeySlice,
+) -> bool {
+    match user_lower {
+        Bound::Included(key) => {
+            if table_upper.raw_ref() < key {
+                return false;
+            }
+        }
+        Bound::Excluded(key) => {
+            if table_upper.raw_ref() <= key {
+                return false;
+            }
+        }
+        Bound::Unbounded => (),
+    }
+
+    match user_upper {
+        Bound::Included(key) => {
+            if key < table_lower.raw_ref() {
+                return false;
+            }
+        }
+
+        Bound::Excluded(key) => {
+            if key <= table_lower.raw_ref() {
+                return false;
+            }
+        }
+
+        Bound::Unbounded => (),
+    }
+
+    true
 }
