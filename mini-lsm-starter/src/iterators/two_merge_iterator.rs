@@ -67,10 +67,8 @@ impl<
             } else {
                 self.a.next()?;
             }
-        } else {
-            if self.b.is_valid() {
-                self.b.next()?;
-            }
+        } else if self.b.is_valid() {
+            self.b.next()?;
         }
 
         if !self.a.is_valid() {
