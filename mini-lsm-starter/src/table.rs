@@ -93,10 +93,8 @@ impl FileObject {
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
         std::fs::write(path, &data)?;
         File::open(path)?.sync_all()?;
-        Ok(FileObject(
-            Some(File::options().read(true).write(false).open(path)?),
-            data.len() as u64,
-        ))
+
+        Ok(FileObject(Some(File::options().read(true).write(false).open(path)?), data.len() as u64))
     }
 
     pub fn open(path: &Path) -> Result<Self> {
