@@ -71,7 +71,7 @@ impl SimpleLeveledCompactionController {
                 });
 
                 println!("{:#?}", task);
-                
+
                 return task;
             }
         }

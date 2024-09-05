@@ -158,7 +158,26 @@ impl LsmStorageInner {
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
         match task {
             CompactionTask::Leveled(_) => todo!(),
-            CompactionTask::Tiered(_) => todo!(),
+            CompactionTask::Tiered(task) => {
+                let snapshot = self.state.read();
+                let mut sst_concat_iter = vec![];
+
+                for entry in task.tiers.iter() {
+                    sst_concat_iter.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                        entry
+                            .1
+                            .iter()
+                            .map(|id| snapshot.sstables[id].clone())
+                            .collect(),
+                    )?));
+                }
+                let sstables = self.compact_generate_sst_from_iter(
+                    MergeIterator::create(sst_concat_iter),
+                    task.bottom_tier_included,
+                )?;
+
+                Ok(sstables)
+            }
             CompactionTask::Simple(task) => {
                 if task.upper_level.is_some() {
                     let iters = {
